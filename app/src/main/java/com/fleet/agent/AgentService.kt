@@ -110,7 +110,7 @@ class AgentService : Service() {
             // su grant, and every shell action below silently no-ops without it.
             // Checked every few cycles, not every cycle — a blocked su prompt costs
             // the full exec timeout, and that latency shouldn't land on each heartbeat.
-            if (!rootOk && cycle % 5 == 0) rootOk = exec("id -u").trim() == "0"
+            if (!rootOk && cycle % 5L == 0L) rootOk = exec("id -u").trim() == "0"
 
             val pid = exec("pidof $pkg").trim()
             val running = pid.isNotEmpty()
