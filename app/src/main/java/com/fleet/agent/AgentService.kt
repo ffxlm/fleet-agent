@@ -40,12 +40,19 @@ class AgentService : Service() {
     private var nextRelaunchAt = 0L
     private var rootOk = false
 
+    // Last known state, written by monitorLoop and read by heartbeatLoop. Volatile
+    // so the heartbeat never publishes a torn view while the monitor updates it.
+    @Volatile private var lastPkg: String = "com.roblox.client"
+    @Volatile private var lastPid: String = ""
+    @Volatile private var lastRunning: Boolean = false
+
     companion object {
         private const val TAG = "FleetAgent"
         private const val CHANNEL = "fleet"
         private const val NOTIF_ID = 1
         private const val HB_FILE = "/sdcard/fleet/heartbeat.json"
         private const val HEARTBEAT_S = 30
+        private const val PROBE_S = 15
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -60,7 +67,29 @@ class AgentService : Service() {
         startForeground(NOTIF_ID, notif("starting"))
         acquireWakeLock()
         connectMqtt()
-        scope.launch { loop() }
+        // SupervisorJob keeps the watchdog alive if loop() throws, but a dead loop
+        // means no heartbeats while the connection still reconnects on Paho's own
+        // thread — the device looks frozen. Wrap it so any crash restarts it.
+        scope.launch {
+            while (true) {
+                try {
+                    monitorLoop()
+                } catch (e: Throwable) {
+                    Log.e(TAG, "monitor loop crashed, restarting", e)
+                }
+                delay(5_000)
+            }
+        }
+        scope.launch {
+            while (true) {
+                try {
+                    heartbeatLoop()
+                } catch (e: Throwable) {
+                    Log.e(TAG, "heartbeat loop crashed, restarting", e)
+                }
+                delay(5_000)
+            }
+        }
         scope.launch { mqttWatchdog() }
     }
 
@@ -101,24 +130,29 @@ class AgentService : Service() {
 
     // ---- main loop: watchdog + heartbeat ----
 
-    private suspend fun loop() {
+    // Shell probing and liveness reporting run on separate coroutines on purpose.
+    // A blocked `su`/`monkey` must never stop the heartbeat: a connected device with
+    // no heartbeats is indistinguishable from a dead one on the board. So the
+    // monitor may block as long as it likes; the heartbeat keeps ticking with the
+    // last known state.
+    private suspend fun monitorLoop() {
         var cycle = 0L
         while (true) {
             val pkg = prefs.getString("pkg", "com.roblox.client") ?: "com.roblox.client"
+            lastPkg = pkg
 
             // Re-check root until granted: a fresh install (new deviceId) loses the old
             // su grant, and every shell action below silently no-ops without it.
             // Checked every few cycles, not every cycle — a blocked su prompt costs
-            // the full exec timeout, and that latency shouldn't land on each heartbeat.
+            // the full exec timeout, and that latency shouldn't land on each probe.
             if (!rootOk && cycle % 5L == 0L) rootOk = exec("id -u").trim() == "0"
 
             val pid = exec("pidof $pkg").trim()
-            val running = pid.isNotEmpty()
+            lastPid = pid
+            lastRunning = pid.isNotEmpty()
 
-            // Backoff applies ONLY to relaunch attempts. Heartbeat cadence stays
-            // constant — otherwise a device that can't launch the game looks offline
-            // on the board for minutes at a time while it is actually connected.
-            if (running) {
+            // Backoff applies ONLY to relaunch attempts, never to the heartbeat.
+            if (lastRunning) {
                 relaunchBackoff = 30
                 nextRelaunchAt = 0
             } else if (System.currentTimeMillis() >= nextRelaunchAt) {
@@ -128,8 +162,14 @@ class AgentService : Service() {
                 nextRelaunchAt = System.currentTimeMillis() + relaunchBackoff * 1000L
             }
 
-            publishHeartbeat(pkg, running, pid)
             cycle++
+            delay(PROBE_S * 1000L)
+        }
+    }
+
+    private suspend fun heartbeatLoop() {
+        while (true) {
+            publishHeartbeat(lastPkg, lastRunning, lastPid)
             delay(HEARTBEAT_S * 1000L)
         }
     }
