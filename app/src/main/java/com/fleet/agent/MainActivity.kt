@@ -2,7 +2,10 @@ package com.fleet.agent
 
 import android.app.Activity
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -21,7 +24,7 @@ class MainActivity : Activity() {
         }
 
         val broker = EditText(this).apply {
-            hint = "broker url  (tcp://host:1883)"
+            hint = "broker url  (wss://host:8084/mqtt  or  tcp://host:1883)"
             setText(prefs.getString("broker", "") ?: "")
         }
         val key = EditText(this).apply {
@@ -50,6 +53,7 @@ class MainActivity : Activity() {
                     .putString("key", key.text.toString().trim())
                     .putString("pkg", pkg.text.toString().trim())
                     .apply()
+                askBatteryExemption()
                 startForegroundService(Intent(this@MainActivity, AgentService::class.java))
             }
         }
@@ -60,5 +64,23 @@ class MainActivity : Activity() {
         root.addView(pkg)
         root.addView(start)
         setContentView(root)
+    }
+
+    // Cloud phones / Doze will kill the agent unless we're exempt. Ask once; if the
+    // provider blocks the dialog the user can whitelist manually in device settings.
+    private fun askBatteryExemption() {
+        try {
+            val pm = getSystemService(PowerManager::class.java)
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            }
+        } catch (_: Exception) {
+            // ignore — device may not support the intent
+        }
     }
 }

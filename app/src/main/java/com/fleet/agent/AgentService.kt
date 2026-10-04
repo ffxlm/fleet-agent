@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -16,8 +17,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
+import org.eclipse.paho.client.mqttv3.MqttCallbackExtended
 import org.eclipse.paho.client.mqttv3.MqttClient
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions
+import org.eclipse.paho.client.mqttv3.MqttMessage
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import java.io.BufferedReader
 import java.io.File
@@ -28,6 +32,7 @@ class AgentService : Service() {
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var mqtt: MqttClient? = null
+    private var wakeLock: PowerManager.WakeLock? = null
     private lateinit var prefs: SharedPreferences
     private var deviceId: String = ""
     private var delaySec = 30
@@ -49,16 +54,45 @@ class AgentService : Service() {
         }
         createChannel()
         startForeground(NOTIF_ID, notif("starting"))
+        acquireWakeLock()
         connectMqtt()
         scope.launch { loop() }
+        scope.launch { mqttWatchdog() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
+        // Graceful shutdown: tell the broker we're gone before disconnecting, so the
+        // board shows offline immediately instead of waiting for the freshness window.
+        try {
+            mqtt?.publish("cf/$deviceId/up/status", "{\"online\":false}".toByteArray(), 1, true)
+        } catch (_: Exception) {}
         try { mqtt?.disconnect() } catch (_: Exception) {}
+        try { wakeLock?.release() } catch (_: Exception) {}
         scope.cancel()
         super.onDestroy()
+    }
+
+    private fun acquireWakeLock() {
+        try {
+            val pm = getSystemService(PowerManager::class.java)
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "fleet:agent").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "wakelock", e)
+        }
+    }
+
+    // Cloud phones aggressively suspend background apps; Paho's auto-reconnect only
+    // fires after a successful connect, so keep a slow watchdog that re-establishes.
+    private suspend fun mqttWatchdog() {
+        while (true) {
+            delay(15_000)
+            if (mqtt?.isConnected != true) connectMqtt()
+        }
     }
 
     // ---- main loop: watchdog + heartbeat ----
@@ -125,11 +159,29 @@ class AgentService : Service() {
             Log.w(TAG, "no broker configured")
             return
         }
+        // Reuse the existing client if we have one — reconnect() keeps the session.
+        val existing = mqtt
+        if (existing != null) {
+            if (existing.isConnected) return
+            try {
+                existing.reconnect()
+                Log.i(TAG, "mqtt reconnected")
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "reconnect failed, rebuilding: ${e.message}")
+                try { existing.close() } catch (_: Exception) {}
+                mqtt = null
+            }
+        }
         try {
             val client = MqttClient(url, deviceId, MemoryPersistence())
             val opts = MqttConnectOptions().apply {
-                isCleanSession = true
+                // Persistent session (stable clientId = deviceId) keeps the down/cmd
+                // subscription alive across drops and queues commands while offline.
+                isCleanSession = false
                 isAutomaticReconnect = true
+                keepAliveInterval = 30
+                connectionTimeout = 15
                 val key = prefs.getString("key", "") ?: ""
                 if (key.isNotEmpty()) userName = key
                 setWill(
@@ -139,18 +191,33 @@ class AgentService : Service() {
                     true
                 )
             }
+            // connectComplete fires on every (re)connect — this is what re-subscribes,
+            // which a cleanSession=true client would silently lose.
+            client.setCallback(object : MqttCallbackExtended {
+                override fun connectComplete(reconnect: Boolean, serverURI: String?) {
+                    Log.i(TAG, "mqtt connected (reconnect=$reconnect)")
+                    try {
+                        client.subscribe("cf/$deviceId/down/cmd", 1) { _, msg ->
+                            handleCommand(String(msg.payload))
+                        }
+                        client.publish(
+                            "cf/$deviceId/up/status",
+                            "{\"online\":true}".toByteArray(),
+                            1,
+                            true
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "post-connect setup", e)
+                    }
+                }
+                override fun messageArrived(topic: String?, message: MqttMessage?) {}
+                override fun deliveryComplete(token: IMqttDeliveryToken?) {}
+                override fun connectionLost(cause: Throwable?) {
+                    Log.w(TAG, "mqtt lost: ${cause?.message}")
+                }
+            })
             client.connect(opts)
-            client.subscribe("cf/$deviceId/down/cmd", 1) { _, msg ->
-                handleCommand(String(msg.payload))
-            }
-            client.publish(
-                "cf/$deviceId/up/status",
-                "{\"online\":true}".toByteArray(),
-                1,
-                true
-            )
             mqtt = client
-            Log.i(TAG, "mqtt connected")
         } catch (e: Exception) {
             Log.e(TAG, "mqtt connect failed", e)
         }
