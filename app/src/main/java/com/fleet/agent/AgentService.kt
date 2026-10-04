@@ -27,6 +27,7 @@ import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 class AgentService : Service() {
 
@@ -101,13 +102,15 @@ class AgentService : Service() {
     // ---- main loop: watchdog + heartbeat ----
 
     private suspend fun loop() {
+        var cycle = 0L
         while (true) {
             val pkg = prefs.getString("pkg", "com.roblox.client") ?: "com.roblox.client"
 
-            // Re-check root every cycle until granted: a fresh install (new deviceId)
-            // loses the old su grant, and every shell action below silently no-ops
-            // without it. Surfacing rootOk on the board is how we see that.
-            if (!rootOk) rootOk = exec("id -u").trim() == "0"
+            // Re-check root until granted: a fresh install (new deviceId) loses the old
+            // su grant, and every shell action below silently no-ops without it.
+            // Checked every few cycles, not every cycle — a blocked su prompt costs
+            // the full exec timeout, and that latency shouldn't land on each heartbeat.
+            if (!rootOk && cycle % 5 == 0) rootOk = exec("id -u").trim() == "0"
 
             val pid = exec("pidof $pkg").trim()
             val running = pid.isNotEmpty()
@@ -126,6 +129,7 @@ class AgentService : Service() {
             }
 
             publishHeartbeat(pkg, running, pid)
+            cycle++
             delay(HEARTBEAT_S * 1000L)
         }
     }
@@ -248,18 +252,39 @@ class AgentService : Service() {
 
     // ---- root shell ----
 
-    private fun exec(cmd: String): String {
+    // Never let a shell call wedge the caller. `su` blocks forever if it decides to
+    // prompt for a grant and stdin is attached to nothing, which would freeze the
+    // heartbeat loop and make a live device look dead. Close stdin, read on a
+    // helper thread, and hard-timeout the process.
+    private fun exec(cmd: String, timeoutSec: Long = 10): String {
         return try {
             val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+            try { p.outputStream.close() } catch (_: Exception) {}
+            try { p.errorStream.close() } catch (_: Exception) {}
+
             val sb = StringBuilder()
-            BufferedReader(InputStreamReader(p.inputStream)).use { r ->
-                var line = r.readLine()
-                while (line != null) {
-                    sb.append(line).append("\n")
-                    line = r.readLine()
+            val reader = Thread {
+                try {
+                    BufferedReader(InputStreamReader(p.inputStream)).use { r ->
+                        var line = r.readLine()
+                        while (line != null) {
+                            sb.append(line).append("\n")
+                            line = r.readLine()
+                        }
+                    }
+                } catch (_: Exception) {
                 }
             }
-            p.waitFor()
+            reader.isDaemon = true
+            reader.start()
+
+            if (!p.waitFor(timeoutSec, TimeUnit.SECONDS)) {
+                Log.w(TAG, "exec timeout: $cmd")
+                p.destroyForcibly()
+                reader.interrupt()
+                return ""
+            }
+            reader.join(1000)
             sb.toString()
         } catch (e: Exception) {
             Log.e(TAG, "exec failed: $cmd", e)
