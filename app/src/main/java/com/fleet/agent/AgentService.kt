@@ -35,7 +35,8 @@ class AgentService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private lateinit var prefs: SharedPreferences
     private var deviceId: String = ""
-    private var delaySec = 30
+    private var relaunchBackoff = 30
+    private var nextRelaunchAt = 0L
     private var rootOk = false
 
     companion object {
@@ -43,6 +44,7 @@ class AgentService : Service() {
         private const val CHANNEL = "fleet"
         private const val NOTIF_ID = 1
         private const val HB_FILE = "/sdcard/fleet/heartbeat.json"
+        private const val HEARTBEAT_S = 30
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -110,16 +112,21 @@ class AgentService : Service() {
             val pid = exec("pidof $pkg").trim()
             val running = pid.isNotEmpty()
 
-            if (!running) {
+            // Backoff applies ONLY to relaunch attempts. Heartbeat cadence stays
+            // constant — otherwise a device that can't launch the game looks offline
+            // on the board for minutes at a time while it is actually connected.
+            if (running) {
+                relaunchBackoff = 30
+                nextRelaunchAt = 0
+            } else if (System.currentTimeMillis() >= nextRelaunchAt) {
                 Log.i(TAG, "$pkg not running -> relaunch (root=$rootOk)")
                 relaunch(pkg)
-                delaySec = (delaySec * 2).coerceAtMost(300)
-            } else {
-                delaySec = 30
+                relaunchBackoff = (relaunchBackoff * 2).coerceAtMost(300)
+                nextRelaunchAt = System.currentTimeMillis() + relaunchBackoff * 1000L
             }
 
             publishHeartbeat(pkg, running, pid)
-            delay(delaySec * 1000L)
+            delay(HEARTBEAT_S * 1000L)
         }
     }
 
