@@ -36,6 +36,7 @@ class AgentService : Service() {
     private lateinit var prefs: SharedPreferences
     private var deviceId: String = ""
     private var delaySec = 30
+    private var rootOk = false
 
     companion object {
         private const val TAG = "FleetAgent"
@@ -100,23 +101,26 @@ class AgentService : Service() {
     private suspend fun loop() {
         while (true) {
             val pkg = prefs.getString("pkg", "com.roblox.client") ?: "com.roblox.client"
-            val running = isRunning(pkg)
+
+            // Re-check root every cycle until granted: a fresh install (new deviceId)
+            // loses the old su grant, and every shell action below silently no-ops
+            // without it. Surfacing rootOk on the board is how we see that.
+            if (!rootOk) rootOk = exec("id -u").trim() == "0"
+
+            val pid = exec("pidof $pkg").trim()
+            val running = pid.isNotEmpty()
 
             if (!running) {
-                Log.i(TAG, "$pkg not running -> relaunch")
+                Log.i(TAG, "$pkg not running -> relaunch (root=$rootOk)")
                 relaunch(pkg)
                 delaySec = (delaySec * 2).coerceAtMost(300)
             } else {
                 delaySec = 30
             }
 
-            publishHeartbeat(pkg, running)
+            publishHeartbeat(pkg, running, pid)
             delay(delaySec * 1000L)
         }
-    }
-
-    private fun isRunning(pkg: String): Boolean {
-        return exec("pidof $pkg").trim().isNotEmpty()
     }
 
     private fun relaunch(pkg: String) {
@@ -129,7 +133,7 @@ class AgentService : Service() {
 
     // ---- heartbeat ----
 
-    private fun publishHeartbeat(pkg: String, running: Boolean) {
+    private fun publishHeartbeat(pkg: String, running: Boolean, pid: String) {
         val client = mqtt ?: return
         if (!client.isConnected) return
 
@@ -140,6 +144,8 @@ class AgentService : Service() {
             append("{\"ts\":").append(System.currentTimeMillis())
             append(",\"pkg\":\"").append(pkg).append("\"")
             append(",\"running\":").append(running)
+            append(",\"root\":").append(rootOk)
+            if (pid.isNotEmpty()) append(",\"pid\":\"").append(pid).append("\"")
             if (extra.isNotEmpty()) append(",\"script\":").append(extra)
             append("}")
         }
